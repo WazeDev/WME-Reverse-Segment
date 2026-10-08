@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WME Reverse Segment
-// @description  Reverses a selected segment's geometry and swaps all direction-dependent attributes (direction, speed limits, lanes, turns, lane guidance).
+// @description  Reverses a selected segment's geometry and swaps all direction-dependent attributes (direction, speed limits, lanes, turns, lane guidance, traffic lights, speed cameras).
 // @namespace    https://greasyfork.org/
-// @version      0.9.1
+// @version      0.10.0
 // @match        /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @include      /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @exclude      *://*.waze.com/user/editor*
@@ -37,6 +37,68 @@
     for (const stack of [am._undoStack, am._redoStack])
       for (const a of stack) _cache(a);
     return _classCache[name] || null;
+  }
+
+  // Replace all undo stack entries added since `start` by one CompositeAction,
+  // so the whole operation is a single undo/redo step. The group is pushed via
+  // am.add so WME fires its usual events (undo counter etc.); its doAction is a
+  // no-op because the wrapped actions are already done. Undo/redo use the
+  // inherited undoAction/redoAction, which walk the subActions.
+  // Undoing/redoing all subActions in one event batch leaves the map showing a
+  // stale segment, so am._undoAction/_redoAction are patched (see bootstrap) to
+  // process each subAction on its own first, like separate undo steps would.
+  let GroupAction = null;
+
+  function patchUndoForGroups() {
+    if (am.__wrsUndoPatched) return;
+    const origUndoAction = am._undoAction;
+    am._undoAction = function (action, opts) {
+      if (!GroupAction || !(action instanceof GroupAction) || !this.canUndoAction(action))
+        return origUndoAction.call(this, action, opts);
+      for (let i = action.subActions.length - 1; i >= 0; i--) {
+        const sub = action.subActions[i];
+        this._undoStack.push(sub);
+        origUndoAction.call(this, sub, { supportRedo: false });
+      }
+      action._subActionsDone = true;
+      try { return origUndoAction.call(this, action, opts); }
+      finally { action._subActionsDone = false; }
+    };
+
+    const origRedoAction = am._redoAction;
+    am._redoAction = function (action, ...rest) {
+      if (!GroupAction || !(action instanceof GroupAction) || !this.canRedoAction(action))
+        return origRedoAction.call(this, action, ...rest);
+      for (const sub of action.subActions) {
+        this._redoStack.push(sub);
+        origRedoAction.call(this, sub);
+        this._undoStack.splice(this._undoStack.indexOf(sub), 1);
+      }
+      action._subActionsDone = true;
+      try { return origRedoAction.call(this, action, ...rest); }
+      finally { action._subActionsDone = false; }
+    };
+    am.__wrsUndoPatched = true;
+  }
+
+  function groupActionsSince(start, description) {
+    const added = am._undoStack.slice(start);
+    if (added.length < 2) return;
+
+    if (!GroupAction) {
+      let Composite = null;
+      for (let c = added[0].constructor; c && c !== Function.prototype; c = Object.getPrototypeOf(c))
+        if (c.name === 'CompositeAction') { Composite = c; break; }
+      if (!Composite) { console.warn('[WME RS] CompositeAction class not found – undo steps not grouped.'); return; }
+      GroupAction = class ReverseSegmentAction extends Composite {
+        doAction() { return true; }
+        undoAction(dm) { if (!this._subActionsDone) super.undoAction(dm); }
+        redoAction(dm) { if (!this._subActionsDone) super.redoAction(dm); }
+      };
+    }
+
+    am._undoStack.splice(start, added.length);
+    am.add(new GroupAction({ _description: description, description }, added));
   }
 
   const samePt = (a, b, eps = 1e-7) =>
@@ -82,10 +144,33 @@
       run();
   }
 
+  // Turn guidance of map entities (e.g. traffic light "Show"/"At") lives in the
+  // internal turn data only and is lost when the segment is reconnected.
+  function findMapEntityGuidance(turns) {
+    const tg = W.model.turnGraph;
+    const anyTurn = tg.getAllTurns()[0];
+    if (!anyTurn) return null;
+    const Vertex = anyTurn.getFromVertex().constructor;
+    const dir = fwd => (fwd ? 'fwd' : 'rev');
+    for (const t of turns) {
+      const turn = tg.getTurn(new Vertex(t.fromSegmentId, dir(t.fromSegmentFwd)), new Vertex(t.toSegmentId, dir(t.toSegmentFwd)));
+      const entries = turn?.getTurnData()?.getMapEntitiesGuidance?.() ?? [];
+      const custom = entries.find(e => !(e.isEffectivelyDefault?.() ?? false));
+      if (custom) return { turn: t, entry: custom };
+    }
+    return null;
+  }
+
   // ---------------------------------------------------------------------------
   // reverseSegment
   // ---------------------------------------------------------------------------
   function reverseSegment(segmentId, sdk, force = false) {
+    const start = am._undoStack.length;
+    try { reverseSegmentSteps(segmentId, sdk, force); }
+    finally { groupActionsSince(start, `Reverse segment ${segmentId}`); }
+  }
+
+  function reverseSegmentSteps(segmentId, sdk, force) {
     const segment = sdk.DataModel.Segments.getById({ segmentId });
     if (!segment) { console.warn('[WME RS] Segment not found:', segmentId); return; }
 
@@ -110,6 +195,13 @@
     const isBtoA        = segment.isBtoA;
     const fromLanesInfo = segment.fromLanesInfo ? structuredClone(segment.fromLanesInfo) : null;
     const toLanesInfo   = segment.toLanesInfo   ? structuredClone(segment.toLanesInfo)   : null;
+
+    // Point hazards (traffic lights, speed cameras, ...) are placed relative to the
+    // segment direction (traffic lights: REV = A end, FWD = B end). Remember them so
+    // they can be put back on the same physical spot with flipped direction afterwards.
+    const hazards = W.model.permanentHazards.getObjectArray()
+      .filter(h => h.getAttribute('segmentId') === +segmentId && h.getGeometry()?.type === 'Point')
+      .map(h => ({ id: h.getID(), direction: h.getAttribute('direction'), geometry: structuredClone(h.getGeometry()) }));
 
     const Turns = sdk.DataModel.Turns;
 
@@ -141,6 +233,14 @@
     if (unsupported && !force) {
       const msg = `Segment ${segmentId} has a turn with guidance data (TTS/shields/visual) that will be lost after reverse. Aborting. Check the "Force" box to execute anyway.`;
       console.log('[WME RS]', msg, '(turn:', unsupported.id, ')');
+      WazeWrap.Alerts.warning('WME Reverse Segment', msg);
+      return;
+    }
+
+    const entityGuidance = force ? null : findMapEntityGuidance(allTurns);
+    if (entityGuidance) {
+      const msg = `Segment ${segmentId} has a turn with traffic light/sign guidance settings that will be lost after reverse. Aborting. Check the "Force" box to execute anyway.`;
+      console.log('[WME RS]', msg, '(turn:', entityGuidance.turn.id, entityGuidance.entry, ')');
       WazeWrap.Alerts.warning('WME Reverse Segment', msg);
       return;
     }
@@ -205,14 +305,31 @@
     for (const neighborId of neighborIds)
       connectEndToEnd(segmentId, neighborId, sdk, false);
 
+    // Flip hazard direction and pin it to its original position. Runs last, because
+    // WME re-snaps hazards (e.g. speed cameras) while turns and lanes are restored.
+    const restoreHazards = () => {
+      if (!hazards.length) return;
+      const UpdateObject = getActionClass('UpdateObject');
+      if (!UpdateObject) { console.warn('[WME RS] UpdateObject class not cached – hazards not restored.'); return; }
+      for (const hz of hazards) {
+        const hazard = W.model.permanentHazards.getObjectById(hz.id);
+        if (!hazard) { console.warn('[WME RS] hazard not found:', hz.id); continue; }
+        const attrs = { geoJSONGeometry: hz.geometry };
+        const direction = { FWD: 'REV', REV: 'FWD' }[hz.direction];
+        if (direction) attrs.direction = direction;
+        try { am.add(new UpdateObject(hazard, attrs)); }
+        catch (e) { console.warn('[WME RS] hazard', hz.id, e); }
+      }
+    };
+
     // Restore allowed turns
     const SetTurn = getActionClass('SetTurn');
-    if (!SetTurn) { console.warn('[WME RS] SetTurn class not cached. Manually set a turn once to seed the cache.'); return; }
+    if (!SetTurn) { console.warn('[WME RS] SetTurn class not cached. Manually set a turn once to seed the cache.'); restoreHazards(); return; }
 
     const tg = W.model.turnGraph;
     const anyTurn = tg.getAllTurns()[0];
     const Vertex = anyTurn ? anyTurn.getFromVertex().constructor : null;
-    if (!Vertex) { console.warn('[WME RS] Vertex class not found.'); return; }
+    if (!Vertex) { console.warn('[WME RS] Vertex class not found.'); restoreHazards(); return; }
 
     const flipDir = fwd => (fwd ? 'rev' : 'fwd');
     const newIdByOld = new Map();
@@ -246,6 +363,8 @@
         catch (e) { console.warn('[WME RS] setTurnLaneGuidance', newTurnId, e); }
       }
     }
+
+    restoreHazards();
   }
 
   // ---------------------------------------------------------------------------
@@ -273,12 +392,12 @@
           Flip A/B
         </wz-button>
         <span class="wrs-info" style="margin-left:0.5rem;" role="button" tabindex="0"
-              data-tip="Reverses the selected segment's geometry and swaps direction-dependent attributes (direction, speed limits, lanes, turns). Not supported for segments that are part of a big junction, a path, has closures or you can't edit (locklevel).">
+              data-tip="Reverses the selected segment's geometry and swaps direction-dependent attributes (direction, speed limits, lanes, turns, traffic lights, speed cameras). Not supported for segments that are part of a big junction, a path, has closures or you can't edit (locklevel).">
           <i class="w-icon w-icon-info" style="font-size:1.25rem;"></i>
         </span>
         <wz-checkbox id="wrs-force" style="margin-left:0.75rem;">Force</wz-checkbox>
         <span class="wrs-info" style="margin-left:0.4rem;" role="button" tabindex="0"
-              data-tip="TTS, visual instructions, etc. of turns won't be restored, you can still continue if Force is checked.">
+              data-tip="TTS, visual instructions, traffic light guidance settings, etc. of turns won't be restored, you can still continue if Force is checked.">
           <i class="w-icon w-icon-info" style="font-size:1.25rem;"></i>
         </span>
       </div>
@@ -409,6 +528,7 @@
       };
       am.__wmeToolsHooked = true;
     }
+    patchUndoForGroups();
 
     sdk = getWmeSdk({ scriptId: 'wme-reverse-segment', scriptName: 'WME Reverse Segment' });
 
