@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         WME Reverse Segment
-// @description  Reverses a selected segment's geometry and swaps all direction-dependent attributes (direction, speed limits, lanes, turns, lane guidance, traffic lights, speed cameras).
+// @description  Reverses a selected segment's geometry and swaps all direction-dependent attributes (direction, speed limits, lanes, turns, lane guidance, turn guidance, traffic lights, speed cameras).
 // @namespace    https://greasyfork.org/
-// @version      0.10.0
+// @version      0.11.1
 // @match        /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @include      /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @exclude      *://*.waze.com/user/editor*
@@ -11,10 +11,21 @@
 // @grant        none
 // ==/UserScript==
 
-/* global W, getWmeSdk, SDK_INITIALIZED */
+/* global W, WazeWrap, getWmeSdk, SDK_INITIALIZED, GM_info */
 
 (function main() {
   'use strict';
+
+  const SCRIPT_NAME    = 'WME Reverse Segment';
+  const SCRIPT_VERSION = GM_info.script.version;
+  const STORAGE_KEY    = 'wme-reverse-segment';
+
+  const changeLog = [
+    { version: '0.9.1',  message: 'Initial version.' },
+    { version: '0.10.0', message: 'Traffic lights and speed cameras are kept on the same spot with flipped direction.' },
+    { version: '0.11.0', message: 'Turn guidance (TTS, road shields, exit signs, towards, visual instructions), traffic light guidance settings and turn restrictions are now restored.' },
+    { version: '0.11.1', message: 'Fixed reversing next to segments with closures (skip them).' },
+  ];
 
   // ---------------------------------------------------------------------------
   // Action class cache + am.add hook
@@ -133,6 +144,8 @@
     const bNode = W.model.nodes.objects[segB.getAttribute(bWhich)];
     if (aNode === bNode) return;
 
+    if (!aNode || !bNode) throw new Error(`node missing while connecting ${segIdA} -> ${segIdB}`);
+
     const run = () => {
       am.add(new DisconnectSegment(segA, aNode, { deleteNode: true }));
       am.add(new ConnectSegment(bNode, segA, { createDefaultTurns }));
@@ -142,21 +155,70 @@
       sdk.Editing.doActions(run, 'Connect segments end-to-end');
     else
       run();
+
+    // ConnectSegment reports success even when WME skips it (e.g. read-only node)
+    if (segA.getAttribute(aWhich) !== bNode.getID())
+      throw new Error(`segment ${segIdA} could not be connected to node ${bNode.getID()}`);
   }
 
-  // Turn guidance of map entities (e.g. traffic light "Show"/"At") lives in the
-  // internal turn data only and is lost when the segment is reconnected.
-  function findMapEntityGuidance(turns) {
+  // ---------------------------------------------------------------------------
+  // Internal turn data
+  // The SDK only exposes flags for turn guidance (TTS, shields, ...), not the
+  // data itself. The internal TurnData holds everything (state, lanes, turn
+  // guidance, map entity guidance, restrictions) and is copied as a whole.
+  // ---------------------------------------------------------------------------
+  const GUIDANCE_FLAGS = {
+    hasCustomTTS:         'TTS',
+    hasShieldsPopulated:  'road shields',
+    hasTowardsGuidance:   'towards',
+    hasTurnGuidance:      'turn guidance',
+    hasVisualInstruction: 'visual instruction',
+  };
+
+  function getInternalTurn(fromSegmentId, fromFwd, toSegmentId, toFwd) {
     const tg = W.model.turnGraph;
     const anyTurn = tg.getAllTurns()[0];
     if (!anyTurn) return null;
     const Vertex = anyTurn.getFromVertex().constructor;
     const dir = fwd => (fwd ? 'fwd' : 'rev');
-    for (const t of turns) {
-      const turn = tg.getTurn(new Vertex(t.fromSegmentId, dir(t.fromSegmentFwd)), new Vertex(t.toSegmentId, dir(t.toSegmentFwd)));
-      const entries = turn?.getTurnData()?.getMapEntitiesGuidance?.() ?? [];
-      const custom = entries.find(e => !(e.isEffectivelyDefault?.() ?? false));
-      if (custom) return { turn: t, entry: custom };
+    return tg.getTurn(new Vertex(fromSegmentId, dir(fromFwd)), new Vertex(toSegmentId, dir(toFwd)));
+  }
+
+  // Map entity guidance = traffic light / sign "Show"/"At" settings
+  const countEntityGuidance = turnData =>
+    (turnData?.getMapEntitiesGuidance?.() ?? []).filter(e => !(e.isEffectivelyDefault?.() ?? false)).length;
+
+  const countRestrictions = turnData =>
+    (turnData?.getRestrictions?.() ?? turnData?.restrictions ?? []).length;
+
+  // ---------------------------------------------------------------------------
+  // Preconditions
+  // Both end nodes are disconnected and reconnected, so they must be fully
+  // editable as well. A connected segment locked above the editor's rank makes
+  // its node read-only, and WME then silently skips the reconnect.
+  // ---------------------------------------------------------------------------
+  const NODE_EDIT_FLAGS = 1 | 4 | 8; // EDIT_GEOMETRY | EDIT_OPEN_TURNS | EDIT_CLOSE_TURNS
+
+  // Returns why the segment can't be reversed, or null if it can
+  function getReverseBlocker(segmentId, sdk) {
+    const segment = sdk.DataModel.Segments.getById({ segmentId });
+    if (!segment) return 'segment not found';
+    if (sdk.DataModel.Segments.connectsToBigJunction({ segmentId })) return 'segment is part of a big junction';
+    if (!sdk.DataModel.Segments.hasPermissions({ segmentId })) return 'insufficient permissions';
+    if (segment.hasClosures) return 'segment has active closures';
+    for (const nodeId of [segment.fromNodeId, segment.toNodeId]) {
+      if (nodeId == null) continue;
+      const node = W.model.nodes.getObjectById(nodeId);
+      if (!node) return `node ${nodeId} is not loaded`;
+      for (const segId of node.getAttribute('segIDs') || []) {
+        if (segId === +segmentId) continue;
+        if (sdk.DataModel.Segments.getById({ segmentId: segId })?.hasClosures)
+          return `connected segment ${segId} has closures`;
+      }
+      if ((node.getAttribute('permissions') & NODE_EDIT_FLAGS) !== NODE_EDIT_FLAGS)
+        return `insufficient permissions on node ${nodeId} (a connected segment is not fully editable)`;
+      for (const segId of node.getAttribute('segIDs') || [])
+        if (!W.model.segments.getObjectById(segId)) return `connected segment ${segId} is not loaded`;
     }
     return null;
   }
@@ -164,30 +226,30 @@
   // ---------------------------------------------------------------------------
   // reverseSegment
   // ---------------------------------------------------------------------------
-  function reverseSegment(segmentId, sdk, force = false) {
+  function reverseSegment(segmentId, sdk) {
+    const blocker = getReverseBlocker(segmentId, sdk);
+    if (blocker) {
+      const msg = `Segment ${segmentId} can't be reversed: ${blocker}.`;
+      console.log('[WME RS]', msg);
+      WazeWrap.Alerts.warning(SCRIPT_NAME, msg);
+      return;
+    }
+
     const start = am._undoStack.length;
-    try { reverseSegmentSteps(segmentId, sdk, force); }
-    finally { groupActionsSince(start, `Reverse segment ${segmentId}`); }
+    try {
+      reverseSegmentSteps(segmentId, sdk);
+    } catch (e) {
+      // Never leave a half reversed segment behind
+      console.error('[WME RS] Reverse failed, undoing all changes.', e);
+      for (let guard = 1000; am._undoStack.length > start && guard > 0; guard--) am.undo();
+      WazeWrap.Alerts.error(SCRIPT_NAME, `Segment ${segmentId} could not be reversed (${e.message}). All changes have been undone.`);
+      return;
+    }
+    groupActionsSince(start, `Reverse segment ${segmentId}`);
   }
 
-  function reverseSegmentSteps(segmentId, sdk, force) {
+  function reverseSegmentSteps(segmentId, sdk) {
     const segment = sdk.DataModel.Segments.getById({ segmentId });
-    if (!segment) { console.warn('[WME RS] Segment not found:', segmentId); return; }
-
-    if (sdk.DataModel.Segments.connectsToBigJunction({ segmentId })) {
-      console.log('[WME RS] Segment', segmentId, 'is part of a big junction – reverse not allowed.');
-      return;
-    }
-
-    if (!sdk.DataModel.Segments.hasPermissions({ segmentId })) {
-      console.log('[WME RS] Segment', segmentId, '– insufficient permissions.');
-      return;
-    }
-
-    if (segment.hasClosures) {
-      console.log('[WME RS] Segment', segmentId, 'has active closures – reverse not allowed.');
-      return;
-    }
 
     const fwdSpeedLimit = segment.fwdSpeedLimit;
     const revSpeedLimit = segment.revSpeedLimit;
@@ -205,45 +267,31 @@
 
     const Turns = sdk.DataModel.Turns;
 
-    const grabTurn = t => ({
-      id:                  t.id,
-      isAllowed:           t.isAllowed,
-      fromSegmentId:       t.fromSegmentId,
-      fromSegmentFwd:      t.fromSegmentFwd,
-      toSegmentId:         t.toSegmentId,
-      toSegmentFwd:        t.toSegmentFwd,
-      lanes:               t.lanes ? structuredClone(t.lanes) : null,
-      hasCustomTTS:        t.hasCustomTTS,
-      hasShieldsPopulated: t.hasShieldsPopulated,
-      hasTowardsGuidance:  t.hasTowardsGuidance,
-      hasTurnGuidance:     t.hasTurnGuidance,
-      hasVisualInstruction: t.hasVisualInstruction,
-    });
+    const grabTurn = t => {
+      const turnData = getInternalTurn(t.fromSegmentId, t.fromSegmentFwd, t.toSegmentId, t.toSegmentFwd)?.getTurnData() ?? null;
+      return {
+        id:                  t.id,
+        isAllowed:           t.isAllowed,
+        fromSegmentId:       t.fromSegmentId,
+        fromSegmentFwd:      t.fromSegmentFwd,
+        toSegmentId:         t.toSegmentId,
+        toSegmentFwd:        t.toSegmentFwd,
+        lanes:               t.lanes ? structuredClone(t.lanes) : null,
+        hasCustomTTS:        t.hasCustomTTS,
+        hasShieldsPopulated: t.hasShieldsPopulated,
+        hasTowardsGuidance:  t.hasTowardsGuidance,
+        hasTurnGuidance:     t.hasTurnGuidance,
+        hasVisualInstruction: t.hasVisualInstruction,
+        // Snapshot before anything is changed (lane counts are cleared below)
+        turnData,
+        entityGuidance:      countEntityGuidance(turnData),
+        restrictions:        countRestrictions(turnData),
+      };
+    };
     const allTurns = [
       ...Turns.getTurnsFromSegment({ segmentId }),
       ...Turns.getTurnsToSegment({ segmentId }),
     ].map(grabTurn);
-
-    // Abort if any turn has guidance data that cannot be restored after reverse,
-    // unless the Force checkbox is checked.
-    const unsupported = allTurns.find(t =>
-      t.hasCustomTTS || t.hasShieldsPopulated || t.hasTowardsGuidance ||
-      t.hasTurnGuidance || t.hasVisualInstruction
-    );
-    if (unsupported && !force) {
-      const msg = `Segment ${segmentId} has a turn with guidance data (TTS/shields/visual) that will be lost after reverse. Aborting. Check the "Force" box to execute anyway.`;
-      console.log('[WME RS]', msg, '(turn:', unsupported.id, ')');
-      WazeWrap.Alerts.warning('WME Reverse Segment', msg);
-      return;
-    }
-
-    const entityGuidance = force ? null : findMapEntityGuidance(allTurns);
-    if (entityGuidance) {
-      const msg = `Segment ${segmentId} has a turn with traffic light/sign guidance settings that will be lost after reverse. Aborting. Check the "Force" box to execute anyway.`;
-      console.log('[WME RS]', msg, '(turn:', entityGuidance.turn.id, entityGuidance.entry, ')');
-      WazeWrap.Alerts.warning('WME Reverse Segment', msg);
-      return;
-    }
 
     const fromTurns = allTurns.filter(t => t.fromSegmentId === segmentId);
     const sides = [
@@ -322,29 +370,66 @@
       }
     };
 
-    // Restore allowed turns
+    // Direction flags of a turn after reverse (only the reversed segment flips)
+    const newFwd = (segId, fwd) => (segId === +segmentId ? !fwd : fwd);
+
+    // Compare the restored turns with the snapshot and warn about anything lost
+    const verifyTurns = () => {
+      const newTurns = [
+        ...Turns.getTurnsFromSegment({ segmentId }),
+        ...Turns.getTurnsToSegment({ segmentId }),
+      ];
+      const lost = new Set();
+      for (const old of allTurns) {
+        if (!old.isAllowed) continue;
+        const fromFwd = newFwd(old.fromSegmentId, old.fromSegmentFwd);
+        const toFwd   = newFwd(old.toSegmentId,   old.toSegmentFwd);
+        const now = newTurns.find(t =>
+          t.fromSegmentId === old.fromSegmentId && t.fromSegmentFwd === fromFwd &&
+          t.toSegmentId   === old.toSegmentId   && t.toSegmentFwd   === toFwd);
+        if (!now || !now.isAllowed) { lost.add('allowed turns'); continue; }
+        for (const [flag, label] of Object.entries(GUIDANCE_FLAGS))
+          if (old[flag] && !now[flag]) lost.add(label);
+        const turnData = getInternalTurn(old.fromSegmentId, fromFwd, old.toSegmentId, toFwd)?.getTurnData();
+        if (countEntityGuidance(turnData) < old.entityGuidance) lost.add('traffic light guidance');
+        if (countRestrictions(turnData)   < old.restrictions)   lost.add('turn restrictions');
+      }
+      if (!lost.size) return;
+      const msg = `Segment ${segmentId}: could not restore ${[...lost].join(', ')}. Please check the turns or undo.`;
+      console.warn('[WME RS]', msg);
+      WazeWrap.Alerts.warning(SCRIPT_NAME, msg);
+    };
+
+    // Restore allowed turns including all turn data (guidance, restrictions, ...)
     const SetTurn = getActionClass('SetTurn');
-    if (!SetTurn) { console.warn('[WME RS] SetTurn class not cached. Manually set a turn once to seed the cache.'); restoreHazards(); return; }
+    if (!SetTurn) { console.warn('[WME RS] SetTurn class not cached. Manually set a turn once to seed the cache.'); restoreHazards(); verifyTurns(); return; }
 
     const tg = W.model.turnGraph;
-    const anyTurn = tg.getAllTurns()[0];
-    const Vertex = anyTurn ? anyTurn.getFromVertex().constructor : null;
-    if (!Vertex) { console.warn('[WME RS] Vertex class not found.'); restoreHazards(); return; }
-
-    const flipDir = fwd => (fwd ? 'rev' : 'fwd');
     const newIdByOld = new Map();
 
     for (const old of allTurns) {
       if (!old.isAllowed) continue;
-      try {
-        const fromDir  = old.fromSegmentId === +segmentId ? flipDir(old.fromSegmentFwd) : (old.fromSegmentFwd ? 'fwd' : 'rev');
-        const toDir    = old.toSegmentId   === +segmentId ? flipDir(old.toSegmentFwd)   : (old.toSegmentFwd   ? 'fwd' : 'rev');
-        const existing = tg.getTurn(new Vertex(old.fromSegmentId, fromDir), new Vertex(old.toSegmentId, toDir));
-        if (!existing) { console.warn('[WME RS] turn not in graph:', old.fromSegmentId, '->', old.toSegmentId); continue; }
-        const allowed = existing.withTurnData(existing.getTurnData().withState(1));
-        am.add(new SetTurn(tg, allowed, {}));
-        newIdByOld.set(old.id, allowed.getID());
-      } catch (e) { console.warn('[WME RS] SetTurn', old.fromSegmentId, '->', old.toSegmentId, e); }
+      const existing = getInternalTurn(old.fromSegmentId, newFwd(old.fromSegmentId, old.fromSegmentFwd),
+                                       old.toSegmentId,   newFwd(old.toSegmentId,   old.toSegmentFwd));
+      if (!existing) { console.warn('[WME RS] turn not in graph:', old.fromSegmentId, '->', old.toSegmentId); continue; }
+      let restored = null;
+      if (old.turnData) {
+        try {
+          restored = existing.withTurnData(old.turnData.withState(1));
+          am.add(new SetTurn(tg, restored, {}));
+        } catch (e) {
+          console.warn('[WME RS] SetTurn with original turn data', old.fromSegmentId, '->', old.toSegmentId, e);
+          restored = null;
+        }
+      }
+      // Fallback: at least allow the turn
+      if (!restored) {
+        try {
+          restored = existing.withTurnData(existing.getTurnData().withState(1));
+          am.add(new SetTurn(tg, restored, {}));
+        } catch (e) { console.warn('[WME RS] SetTurn', old.fromSegmentId, '->', old.toSegmentId, e); continue; }
+      }
+      newIdByOld.set(old.id, restored.getID());
     }
 
     // Restore lane counts and lane guidance per direction
@@ -365,6 +450,7 @@
     }
 
     restoreHazards();
+    verifyTurns();
   }
 
   // ---------------------------------------------------------------------------
@@ -392,14 +478,10 @@
           Flip A/B
         </wz-button>
         <span class="wrs-info" style="margin-left:0.5rem;" role="button" tabindex="0"
-              data-tip="Reverses the selected segment's geometry and swaps direction-dependent attributes (direction, speed limits, lanes, turns, traffic lights, speed cameras). Not supported for segments that are part of a big junction, a path, has closures or you can't edit (locklevel).">
+              data-tip="Reverses the selected segment's geometry and swaps direction-dependent attributes (direction, speed limits, lanes, turns incl. turn guidance and restrictions, traffic lights, speed cameras). Not supported for segments that are part of a big junction, a path, has closures or you can't fully edit (both also apply to the segments connected to it).">
           <i class="w-icon w-icon-info" style="font-size:1.25rem;"></i>
         </span>
-        <wz-checkbox id="wrs-force" style="margin-left:0.75rem;">Force</wz-checkbox>
-        <span class="wrs-info" style="margin-left:0.4rem;" role="button" tabindex="0"
-              data-tip="TTS, visual instructions, traffic light guidance settings, etc. of turns won't be restored, you can still continue if Force is checked.">
-          <i class="w-icon w-icon-info" style="font-size:1.25rem;"></i>
-        </span>
+        <span id="wrs-reason" class="wrs-reason" hidden></span>
       </div>
     `;
 
@@ -410,13 +492,14 @@
     const btn = document.getElementById('wrs-btn');
     const selected = sdk.Editing.getSelection();
     if (selected && selected.ids.length === 1) {
-      const selId = selected.ids[0];
-      const seg = sdk.DataModel.Segments.getById({ segmentId: selId });
-      if (sdk.DataModel.Segments.connectsToBigJunction({ segmentId: selId }) ||
-          (seg && seg.hasClosures) ||
-          !sdk.DataModel.Segments.hasPermissions({ segmentId: selId })) {
+      const blocker = getReverseBlocker(selected.ids[0], sdk);
+      if (blocker) {
         btn.setAttribute('disabled', 'true');
-        document.getElementById('wrs-force')?.setAttribute('disabled', 'true');
+        // Disabled buttons may not receive hover events, so the row carries the title too
+        btn.title = btn.parentElement.title = blocker;
+        const reason = document.getElementById('wrs-reason');
+        reason.textContent = blocker.charAt(0).toUpperCase() + blocker.slice(1);
+        reason.hidden = false;
       }
     }
 
@@ -427,8 +510,7 @@
         alert('Please select exactly one segment.');
         return;
       }
-      const force = document.getElementById('wrs-force')?.shadowRoot?.querySelector('input[type="checkbox"]')?.checked ?? false;
-      reverseSegment(selected.ids[0], sdk, force);
+      reverseSegment(selected.ids[0], sdk);
     });
   }
 
@@ -491,6 +573,11 @@
     style.textContent = `
       .wrs-info { display:inline-flex; align-items:center; cursor:pointer; }
       .wrs-info:focus-visible { outline:2px solid var(--primary, #0075e3); border-radius:50%; }
+      .wrs-reason {
+        flex:1; min-width:0; margin-left:0.5rem;
+        font-size:11px; line-height:1.3; white-space:normal; overflow-wrap:anywhere;
+        color:var(--content_p2, #72767d);
+      }
       #wrs-tooltip {
         display:none; position:fixed; z-index:10000; max-width:260px;
         padding:6px 10px; border-radius:6px;
@@ -530,7 +617,7 @@
     }
     patchUndoForGroups();
 
-    sdk = getWmeSdk({ scriptId: 'wme-reverse-segment', scriptName: 'WME Reverse Segment' });
+    sdk = getWmeSdk({ scriptId: 'wme-reverse-segment', scriptName: SCRIPT_NAME });
 
     await new Promise(resolve => {
       if (sdk.State.isReady()) resolve();
@@ -552,8 +639,44 @@
 
     // Expose reverseSegment on window for manual console use
     window.wmeRS = {
-      reverseSegment: (segmentId, force = false) => reverseSegment(segmentId, sdk, force),
+      reverseSegment: segmentId => reverseSegment(segmentId, sdk),
     };
+
+    showChangeLog();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Changelog: shows the entries newer than the last seen version once per update
+  // ---------------------------------------------------------------------------
+  function compareVersions(a, b) {
+    const pa = a.split('.').map(Number), pb = b.split('.').map(Number);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+      const d = (pa[i] || 0) - (pb[i] || 0);
+      if (d) return d;
+    }
+    return 0;
+  }
+
+  function showChangeLog() {
+    if (!WazeWrap?.Ready) { setTimeout(showChangeLog, 200); return; }
+
+    let settings = {};
+    try { settings = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch (e) {}
+    const previousVersion = settings.version;
+    if (previousVersion === SCRIPT_VERSION) return;
+
+    // Fresh install or unknown previous version: only show the current release
+    const entries = previousVersion
+      ? changeLog.filter(c => compareVersions(c.version, previousVersion) > 0 && compareVersions(c.version, SCRIPT_VERSION) <= 0)
+      : changeLog.filter(c => c.version === SCRIPT_VERSION);
+
+    if (entries.length) {
+      const html = '<ul>' + entries.map(c => `<li>v${c.version}: ${c.message}</li>`).join('') + '</ul>';
+      WazeWrap.Interface.ShowScriptUpdate(SCRIPT_NAME, SCRIPT_VERSION, html, '', '');
+    }
+
+    settings.version = SCRIPT_VERSION;
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(settings)); } catch (e) {}
   }
 
   // Inject styles
