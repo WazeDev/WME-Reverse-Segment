@@ -46,3 +46,7 @@ The shortcut can be changed in the WME keyboard shortcuts dialog (**WME Reverse 
 ## License
 
 [MIT](LICENSE)
+
+## Development
+
+Linting uses the shared [WazeDev ESLint config](https://github.com/WazeDev/Eslint-Config), the same as the GitHub action on pull requests and pushes to `main`. Run it locally with `./lint.sh` (requires Node.js; `./lint.sh --fix` applies automatic fixes).
