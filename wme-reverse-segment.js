@@ -25,6 +25,7 @@
     { version: '0.10.0', message: 'Traffic lights and speed cameras are kept on the same spot with flipped direction.' },
     { version: '0.11.0', message: 'Turn guidance (TTS, road shields, exit signs, towards, visual instructions), traffic light guidance settings and turn restrictions are now restored.' },
     { version: '0.11.1', message: 'Fixed reversing next to segments with closures (skip them).' },
+    { version: '0.12.0', message: 'Keyboard shortcut for Flip A/B (default Alt+R, can be changed in the WME keyboard shortcuts).' },
   ];
 
   // ---------------------------------------------------------------------------
@@ -503,15 +504,94 @@
       }
     }
 
-    btn.addEventListener('click', () => {
-      if (!sdk) { console.warn('[WME RS] SDK not ready.'); return; }
-      const selected = sdk.Editing.getSelection();
-      if (!selected || selected.objectType !== 'segment' || selected.ids.length !== 1) {
-        alert('Please select exactly one segment.');
-        return;
+    btn.addEventListener('click', flipSelectedSegment);
+  }
+
+  function flipSelectedSegment() {
+    if (!sdk) { console.warn('[WME RS] SDK not ready.'); return; }
+    const selected = sdk.Editing.getSelection();
+    if (!selected || selected.objectType !== 'segment' || selected.ids.length !== 1) {
+      WazeWrap.Alerts.info(SCRIPT_NAME, 'Please select exactly one segment.');
+      return;
+    }
+    // Shows why the segment can't be reversed, if so
+    reverseSegment(selected.ids[0], sdk);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Keyboard shortcut
+  // Registered via the SDK, so it shows up in (and can be changed via) the WME
+  // keyboard shortcuts dialog. Changed keys are saved when the dialog changes
+  // and on unload, and restored on the next start.
+  // ---------------------------------------------------------------------------
+  const SHORTCUT_ID           = 'wme-reverse-segment-flip';
+  const SHORTCUT_DESCRIPTION  = 'Flip A/B of the selected segment';
+  const DEFAULT_SHORTCUT_KEYS = 'A+82'; // Alt+R
+
+  function initShortcut() {
+    const shortcut = {
+      shortcutId:   SHORTCUT_ID,
+      description:  SHORTCUT_DESCRIPTION,
+      shortcutKeys: loadSettings().shortcutKeys ?? DEFAULT_SHORTCUT_KEYS,
+      callback:     flipSelectedSegment,
+    };
+    try {
+      if (shortcut.shortcutKeys && sdk.Shortcuts.areShortcutKeysInUse({ shortcutKeys: shortcut.shortcutKeys })) {
+        console.warn('[WME RS] Shortcut keys already in use:', shortcut.shortcutKeys);
+        shortcut.shortcutKeys = null;
       }
-      reverseSegment(selected.ids[0], sdk);
+      sdk.Shortcuts.createShortcut(shortcut);
+    } catch (e) {
+      console.warn('[WME RS] Failed to create shortcut, registering it without keys.', e);
+      try { sdk.Shortcuts.createShortcut({ ...shortcut, shortcutKeys: null }); } catch (e2) { console.error('[WME RS] createShortcut', e2); }
+    }
+
+    window.addEventListener('beforeunload', saveShortcut);
+
+    // Save right away when the keys are changed in the keyboard shortcuts dialog
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest?.('#keyboard-dialog-link')) return;
+      setTimeout(() => {
+        const dialog = document.querySelector('#wz-dialog-container');
+        if (dialog) new MutationObserver(saveShortcut).observe(dialog, { subtree: true, childList: true, characterData: true });
+      }, 100);
     });
+  }
+
+  function saveShortcut() {
+    let current;
+    try { current = sdk.Shortcuts.getAllShortcuts().find(s => s.shortcutId === SHORTCUT_ID); }
+    catch (e) { return; }
+    if (!current) return;
+    const keys = formatShortcutKeys(current.shortcutKeys);
+    const settings = loadSettings();
+    if (settings.shortcutKeys === keys) return;
+    settings.shortcutKeys = keys;
+    saveSettings(settings);
+  }
+
+  // getAllShortcuts returns "<modifiers>,<keyCode>" (e.g. "1,81"), createShortcut
+  // expects "<C|S|A>+<keyCode>" (e.g. "C+81"), see
+  // https://www.waze.com/editor/sdk/interfaces/index.SDK.KeyboardShortcut.html#shortcutkeys
+  function formatShortcutKeys(input) {
+    if (!input) return '';
+    if (!input.includes(',')) return input;
+    const [mods, key] = input.split(',');
+    const m = parseInt(mods, 10);
+    if (!m) return key;
+    const prefix = (m & 1 ? 'C' : '') + (m & 2 ? 'S' : '') + (m & 4 ? 'A' : '');
+    return `${prefix}+${key}`;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Settings (localStorage)
+  // ---------------------------------------------------------------------------
+  function loadSettings() {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch (e) { return {}; }
+  }
+
+  function saveSettings(settings) {
+    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(settings)); } catch (e) {}
   }
 
   // ---------------------------------------------------------------------------
@@ -642,6 +722,7 @@
       reverseSegment: segmentId => reverseSegment(segmentId, sdk),
     };
 
+    initShortcut();
     showChangeLog();
   }
 
@@ -660,8 +741,7 @@
   function showChangeLog() {
     if (!WazeWrap?.Ready) { setTimeout(showChangeLog, 200); return; }
 
-    let settings = {};
-    try { settings = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch (e) {}
+    const settings = loadSettings();
     const previousVersion = settings.version;
     if (previousVersion === SCRIPT_VERSION) return;
 
@@ -676,7 +756,7 @@
     }
 
     settings.version = SCRIPT_VERSION;
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(settings)); } catch (e) {}
+    saveSettings(settings);
   }
 
   // Inject styles
