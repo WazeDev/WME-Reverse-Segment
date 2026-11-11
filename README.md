@@ -5,7 +5,7 @@ A [Waze Map Editor (WME)](https://www.waze.com/editor) userscript that reverses 
 ## Installation
 
 1. Install a userscript manager such as [Tampermonkey](https://www.tampermonkey.net/).
-2. Install `wme-reverse-segment.js` in the userscript manager.
+2. Install the script from [Greasy Fork](https://greasyfork.org/scripts/604901-wme-reverse-segment).
 3. Open WME. The script loads automatically and requires [WazeWrap](https://greasyfork.org/scripts/24851-wazewrap).
 
 ## Usage

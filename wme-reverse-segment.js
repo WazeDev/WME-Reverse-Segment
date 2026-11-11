@@ -23,6 +23,7 @@
   const SCRIPT_NAME = "WME Reverse Segment";
   const SCRIPT_VERSION = GM_info.script.version;
   const STORAGE_KEY = "wme-reverse-segment";
+  const GREASYFORK_URL = "https://greasyfork.org/scripts/604901-wme-reverse-segment";
 
   const changeLog = [
     { version: "0.9.1", message: "Initial version." },
@@ -769,7 +770,7 @@
 
     if (entries.length) {
       const html = `<ul>${entries.map(c => `<li>v${c.version}: ${c.message}</li>`).join("")}</ul>`;
-      WazeWrap.Interface.ShowScriptUpdate(SCRIPT_NAME, SCRIPT_VERSION, html, "", "");
+      WazeWrap.Interface.ShowScriptUpdate(SCRIPT_NAME, SCRIPT_VERSION, html, GREASYFORK_URL, "");
     }
 
     settings.version = SCRIPT_VERSION;
