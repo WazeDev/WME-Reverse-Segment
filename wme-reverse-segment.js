@@ -3,7 +3,7 @@
 // @description  Reverses a selected segment's geometry and swaps all direction-dependent attributes (direction, speed limits, lanes, turns, lane guidance, turn guidance, traffic lights, speed cameras).
 // @namespace    https://greasyfork.org/
 // @license      MIT
-// @version      0.12.0
+// @version      0.12.1
 // @match        /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @include      /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @exclude      *://*.waze.com/user/editor*
@@ -27,6 +27,7 @@
     { version: '0.11.0', message: 'Turn guidance (TTS, road shields, exit signs, towards, visual instructions), traffic light guidance settings and turn restrictions are now restored.' },
     { version: '0.11.1', message: 'Fixed reversing next to segments with closures (skip them).' },
     { version: '0.12.0', message: 'Keyboard shortcut for Flip A/B (default Alt+R, can be changed in the WME keyboard shortcuts).' },
+    { version: '0.12.1', message: 'Fixed "illegal turn" on save after switching a segment to one-way before reversing.' },
   ];
 
   // ---------------------------------------------------------------------------
@@ -375,6 +376,19 @@
     // Direction flags of a turn after reverse (only the reversed segment flips)
     const newFwd = (segId, fwd) => (segId === +segmentId ? !fwd : fwd);
 
+    // Turns against a one-way direction keep their allowed state in WME (e.g. after
+    // switching a segment to one-way), but setting them explicitly is rejected on
+    // save ("illegal turn"). Only restore turns that can be driven after reverse.
+    // Unknown direction (neither A->B nor B->A) counts as drivable.
+    const isDrivable = (segId, fwd) => {
+      const s = sdk.DataModel.Segments.getById({ segmentId: segId });
+      if (!s || s.isTwoWay || (!s.isAtoB && !s.isBtoA)) return true;
+      return fwd ? s.isAtoB : s.isBtoA;
+    };
+    const isRestorable = old => old.isAllowed &&
+      isDrivable(old.fromSegmentId, newFwd(old.fromSegmentId, old.fromSegmentFwd)) &&
+      isDrivable(old.toSegmentId,   newFwd(old.toSegmentId,   old.toSegmentFwd));
+
     // Compare the restored turns with the snapshot and warn about anything lost
     const verifyTurns = () => {
       const newTurns = [
@@ -383,7 +397,7 @@
       ];
       const lost = new Set();
       for (const old of allTurns) {
-        if (!old.isAllowed) continue;
+        if (!isRestorable(old)) continue;
         const fromFwd = newFwd(old.fromSegmentId, old.fromSegmentFwd);
         const toFwd   = newFwd(old.toSegmentId,   old.toSegmentFwd);
         const now = newTurns.find(t =>
@@ -410,7 +424,7 @@
     const newIdByOld = new Map();
 
     for (const old of allTurns) {
-      if (!old.isAllowed) continue;
+      if (!isRestorable(old)) continue;
       const existing = getInternalTurn(old.fromSegmentId, newFwd(old.fromSegmentId, old.fromSegmentFwd),
                                        old.toSegmentId,   newFwd(old.toSegmentId,   old.toSegmentFwd));
       if (!existing) { console.warn('[WME RS] turn not in graph:', old.fromSegmentId, '->', old.toSegmentId); continue; }
@@ -441,7 +455,7 @@
       catch (e) { console.warn('[WME RS] setSegmentTurnsLaneCount', side.name, e); }
 
       for (const old of side.turns) {
-        if (!old.isAllowed || !old.lanes) continue;
+        if (!old.lanes || !isRestorable(old)) continue;
         const newTurnId = newIdByOld.get(old.id);
         if (!newTurnId) { console.warn('[WME RS] no new turn ID for', old.id); continue; }
         const laneIndexes = [];
