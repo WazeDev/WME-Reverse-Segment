@@ -2,7 +2,8 @@
 // @name         WME Reverse Segment
 // @description  Reverses a selected segment's geometry and swaps all direction-dependent attributes (direction, speed limits, lanes, turns, lane guidance, turn guidance, traffic lights, speed cameras).
 // @namespace    https://greasyfork.org/
-// @version      0.11.1
+// @license      MIT
+// @version      0.12.0
 // @match        /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @include      /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @exclude      *://*.waze.com/user/editor*
