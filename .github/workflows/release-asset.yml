@@ -1,0 +1,24 @@
+name: Release Asset
+
+# Attaches the userscript to each published release, so
+# https://github.com/WazeDev/WME-Reverse-Segment/releases/latest/download/wme-reverse-segment.js
+# (the Greasy Fork sync URL) can be downloaded.
+on:
+  release:
+    types: [published]
+
+jobs:
+  upload:
+    name: Upload userscript to release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout release tag
+      uses: actions/checkout@v7
+
+    - name: Upload wme-reverse-segment.js
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: gh release upload "${{ github.event.release.tag_name }}" wme-reverse-segment.js --clobber
