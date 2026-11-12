@@ -33,7 +33,7 @@
     { version: "0.12.0", message: "Keyboard shortcut for Flip A/B (default Alt+R, can be changed in the WME keyboard shortcuts)." },
     { version: "0.12.1", message: "Fixed \"illegal turn\" on save after switching a segment to one-way before reversing." },
     { version: "1.0.0", message: "First public release on Greasy Fork." },
-    { version: "1.0.1", message: "Messages name the affected node as node A or node B." },
+    { version: "1.0.1", message: "Messages name the affected node as node A or node B. Segments with turn guidance you are not allowed to edit (rank) are no longer reversed." },
   ];
 
   // ---------------------------------------------------------------------------
@@ -201,6 +201,36 @@
   // eslint-disable-next-line no-bitwise
   const NODE_EDIT_FLAGS = 1 | 4 | 8; // EDIT_GEOMETRY | EDIT_OPEN_TURNS | EDIT_CLOSE_TURNS
 
+  // Mirrors WME's check for country/rank based permissions such as
+  // "allowEditingTurnGuidanceRank": a boolean user permission wins, otherwise the
+  // country's minimum rank applies; null means nobody may edit it.
+  function hasRankPermission(key, countryId) {
+    const id = countryId ?? W.model.getTopCountry?.()?.getID();
+    if (id == null) return false;
+    let value = W.model.getUserPermissions?.()?.[id]?.[key];
+    if (typeof value !== "boolean") value = W.model.countries?.getObjectById(id)?.getAttribute(key) ?? null;
+    if (typeof value === "boolean") return value;
+    if (typeof value === "number") {
+      const { user } = W.loginManager;
+      return (user?.getAttribute?.("rank") ?? user?.attributes?.rank ?? user?.rank ?? 0) >= value;
+    }
+    return false;
+  }
+
+  function getSegmentCountryId(seg) {
+    const street = W.model.streets.getObjectById(seg.getAttribute("primaryStreetID"));
+    const city = street && W.model.cities.getObjectById(street.getAttribute("cityID"));
+    return city?.getAttribute("countryID") ?? null;
+  }
+
+  // Turn guidance of a turn can be edited if its from segment allows it and the
+  // editor's rank is high enough for the country (same as WME's turn panel).
+  function canEditTurnGuidance(fromSegmentId) {
+    const seg = W.model.segments.getObjectById(fromSegmentId);
+    if (!seg?.canEditTurnGuidance?.()) return false;
+    return hasRankPermission("allowEditingTurnGuidanceRank", getSegmentCountryId(seg));
+  }
+
   // Returns why the segment can't be reversed, or null if it can
   function getReverseBlocker(segmentId, sdk) {
     const segment = sdk.DataModel.Segments.getById({ segmentId });
@@ -208,6 +238,15 @@
     if (sdk.DataModel.Segments.connectsToBigJunction({ segmentId })) return "segment is part of a big junction";
     if (!sdk.DataModel.Segments.hasPermissions({ segmentId })) return "insufficient permissions";
     if (segment.hasClosures) return "segment has active closures";
+    // Restoring the turns rewrites their turn guidance, which needs the rights for it
+    const turns = [...sdk.DataModel.Turns.getTurnsFromSegment({ segmentId }), ...sdk.DataModel.Turns.getTurnsToSegment({ segmentId })];
+    const guided = turns.find(t => t.isAllowed && Object.keys(GUIDANCE_FLAGS).some(f => t[f]) && !canEditTurnGuidance(t.fromSegmentId));
+    if (guided) {
+      // Turns leaving A->B and entering B->A pass node B, all others node A
+      const atB = guided.fromSegmentId === +segmentId ? guided.fromSegmentFwd : !guided.toSegmentFwd;
+      const [end, nodeId] = atB ? ["B", segment.toNodeId] : ["A", segment.fromNodeId];
+      return `a turn at node ${end} (id ${nodeId}) has turn guidance you are not allowed to edit`;
+    }
     for (const [end, nodeId] of [["A", segment.fromNodeId], ["B", segment.toNodeId]]) {
       if (nodeId == null) continue;
       const nodeName = `node ${end} (id ${nodeId})`;
