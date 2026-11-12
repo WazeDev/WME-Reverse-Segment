@@ -3,7 +3,7 @@
 // @description  Reverses a selected segment's geometry and swaps all direction-dependent attributes (direction, speed limits, lanes, turns, lane guidance, turn guidance, traffic lights, speed cameras).
 // @namespace    https://github.com/WazeDev/WME-Reverse-Segment
 // @license      MIT
-// @version      1.0.1
+// @version      1.0.2
 // @match        /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @include      /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @exclude      *://*.waze.com/user/editor*
@@ -34,6 +34,7 @@
     { version: "0.12.1", message: "Fixed \"illegal turn\" on save after switching a segment to one-way before reversing." },
     { version: "1.0.0", message: "First public release on Greasy Fork." },
     { version: "1.0.1", message: "Messages name the affected node as node A or node B. Segments with turn guidance you are not allowed to edit (rank) are no longer reversed." },
+    { version: "1.0.2", message: "Improved order of the checks." },
   ];
 
   // ---------------------------------------------------------------------------
@@ -238,15 +239,6 @@
     if (sdk.DataModel.Segments.connectsToBigJunction({ segmentId })) return "segment is part of a big junction";
     if (!sdk.DataModel.Segments.hasPermissions({ segmentId })) return "insufficient permissions";
     if (segment.hasClosures) return "segment has active closures";
-    // Restoring the turns rewrites their turn guidance, which needs the rights for it
-    const turns = [...sdk.DataModel.Turns.getTurnsFromSegment({ segmentId }), ...sdk.DataModel.Turns.getTurnsToSegment({ segmentId })];
-    const guided = turns.find(t => t.isAllowed && Object.keys(GUIDANCE_FLAGS).some(f => t[f]) && !canEditTurnGuidance(t.fromSegmentId));
-    if (guided) {
-      // Turns leaving A->B and entering B->A pass node B, all others node A
-      const atB = guided.fromSegmentId === +segmentId ? guided.fromSegmentFwd : !guided.toSegmentFwd;
-      const [end, nodeId] = atB ? ["B", segment.toNodeId] : ["A", segment.fromNodeId];
-      return `a turn at node ${end} (id ${nodeId}) has turn guidance you are not allowed to edit`;
-    }
     for (const [end, nodeId] of [["A", segment.fromNodeId], ["B", segment.toNodeId]]) {
       if (nodeId == null) continue;
       const nodeName = `node ${end} (id ${nodeId})`;
@@ -255,10 +247,22 @@
       for (const segId of node.getAttribute("segIDs") || []) {
         if (segId === +segmentId) continue;
         if (sdk.DataModel.Segments.getById({ segmentId: segId })?.hasClosures) return `connected segment ${segId} at ${nodeName} has closures`;
+        if (!sdk.DataModel.Segments.hasPermissions({ segmentId: segId })) {
+          return `connected segment ${segId} at ${nodeName} can't be edited by you (e.g. lock level)`;
+        }
       }
       // eslint-disable-next-line no-bitwise
       if ((node.getAttribute("permissions") & NODE_EDIT_FLAGS) !== NODE_EDIT_FLAGS) return `insufficient permissions on ${nodeName} (a connected segment is not fully editable)`;
       for (const segId of node.getAttribute("segIDs") || []) if (!W.model.segments.getObjectById(segId)) return `connected segment ${segId} at ${nodeName} is not loaded`;
+    }
+    // Restoring the turns rewrites their turn guidance, which needs the rights for it
+    const turns = [...sdk.DataModel.Turns.getTurnsFromSegment({ segmentId }), ...sdk.DataModel.Turns.getTurnsToSegment({ segmentId })];
+    const guided = turns.find(t => t.isAllowed && Object.keys(GUIDANCE_FLAGS).some(f => t[f]) && !canEditTurnGuidance(t.fromSegmentId));
+    if (guided) {
+      // Turns leaving A->B and entering B->A pass node B, all others node A
+      const atB = guided.fromSegmentId === +segmentId ? guided.fromSegmentFwd : !guided.toSegmentFwd;
+      const [end, nodeId] = atB ? ["B", segment.toNodeId] : ["A", segment.fromNodeId];
+      return `a turn at node ${end} (id ${nodeId}) has turn guidance you are not allowed to edit`;
     }
     return null;
   }
