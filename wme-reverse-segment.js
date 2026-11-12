@@ -3,7 +3,7 @@
 // @description  Reverses a selected segment's geometry and swaps all direction-dependent attributes (direction, speed limits, lanes, turns, lane guidance, turn guidance, traffic lights, speed cameras).
 // @namespace    https://github.com/WazeDev/WME-Reverse-Segment
 // @license      MIT
-// @version      1.0.0
+// @version      1.0.1
 // @match        /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @include      /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @exclude      *://*.waze.com/user/editor*
@@ -33,6 +33,7 @@
     { version: "0.12.0", message: "Keyboard shortcut for Flip A/B (default Alt+R, can be changed in the WME keyboard shortcuts)." },
     { version: "0.12.1", message: "Fixed \"illegal turn\" on save after switching a segment to one-way before reversing." },
     { version: "1.0.0", message: "First public release on Greasy Fork." },
+    { version: "1.0.1", message: "Messages name the affected node as node A or node B." },
   ];
 
   // ---------------------------------------------------------------------------
@@ -207,17 +208,18 @@
     if (sdk.DataModel.Segments.connectsToBigJunction({ segmentId })) return "segment is part of a big junction";
     if (!sdk.DataModel.Segments.hasPermissions({ segmentId })) return "insufficient permissions";
     if (segment.hasClosures) return "segment has active closures";
-    for (const nodeId of [segment.fromNodeId, segment.toNodeId]) {
+    for (const [end, nodeId] of [["A", segment.fromNodeId], ["B", segment.toNodeId]]) {
       if (nodeId == null) continue;
+      const nodeName = `node ${end} (id ${nodeId})`;
       const node = W.model.nodes.getObjectById(nodeId);
-      if (!node) return `node ${nodeId} is not loaded`;
+      if (!node) return `${nodeName} is not loaded`;
       for (const segId of node.getAttribute("segIDs") || []) {
         if (segId === +segmentId) continue;
-        if (sdk.DataModel.Segments.getById({ segmentId: segId })?.hasClosures) return `connected segment ${segId} has closures`;
+        if (sdk.DataModel.Segments.getById({ segmentId: segId })?.hasClosures) return `connected segment ${segId} at ${nodeName} has closures`;
       }
       // eslint-disable-next-line no-bitwise
-      if ((node.getAttribute("permissions") & NODE_EDIT_FLAGS) !== NODE_EDIT_FLAGS) return `insufficient permissions on node ${nodeId} (a connected segment is not fully editable)`;
-      for (const segId of node.getAttribute("segIDs") || []) if (!W.model.segments.getObjectById(segId)) return `connected segment ${segId} is not loaded`;
+      if ((node.getAttribute("permissions") & NODE_EDIT_FLAGS) !== NODE_EDIT_FLAGS) return `insufficient permissions on ${nodeName} (a connected segment is not fully editable)`;
+      for (const segId of node.getAttribute("segIDs") || []) if (!W.model.segments.getObjectById(segId)) return `connected segment ${segId} at ${nodeName} is not loaded`;
     }
     return null;
   }
