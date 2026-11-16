@@ -34,7 +34,7 @@
     { version: "0.12.1", message: "Fixed \"illegal turn\" on save after switching a segment to one-way before reversing." },
     { version: "1.0.0", message: "First public release on Greasy Fork." },
     { version: "1.0.1", message: "Messages name the affected node as node A or node B. Segments with turn guidance you are not allowed to edit (rank) are no longer reversed." },
-    { version: "1.0.2", message: "Improved order of the checks." },
+    { version: "1.0.2", message: "Improved order of the checks. Segments locked above your level are reported as such." },
   ];
 
   // ---------------------------------------------------------------------------
@@ -202,6 +202,27 @@
   // eslint-disable-next-line no-bitwise
   const NODE_EDIT_FLAGS = 1 | 4 | 8; // EDIT_GEOMETRY | EDIT_OPEN_TURNS | EDIT_CLOSE_TURNS
 
+  // Rank as used by WME internally: 0-based (L1 = 0)
+  function getUserRank() {
+    const { user } = W.loginManager;
+    return user?.getAttribute?.("rank") ?? user?.attributes?.rank ?? user?.rank ?? 0;
+  }
+
+  // Reversing changes geometry, properties (lanes, speed limits), direction and the
+  // turns of the segment; connected segments only need their turns to be editable.
+  // hasPermissions() without a permission is already true if suggesting is allowed.
+  const SEGMENT_PERMISSIONS = ["EDIT_GEOMETRY", "EDIT_PROPERTIES", "EDIT_DIRECTIONS", "EDIT_CONNECTIONS"];
+  const NEIGHBOR_PERMISSIONS = ["EDIT_CONNECTIONS"];
+
+  // Returns why the segment can't be fully edited (e.g. locked higher), or null if it can
+  function getEditBlocker(segmentId, permissions, sdk) {
+    if (permissions.every(permission => sdk.DataModel.Segments.hasPermissions({ segmentId, permission }))) return null;
+    const lockRank = W.model.segments.getObjectById(segmentId)?.getAttribute("lockRank");
+    const rank = getUserRank();
+    if (lockRank != null && lockRank > rank) return `is locked at level ${lockRank + 1} (your level: ${rank + 1})`;
+    return "can't be fully edited by you";
+  }
+
   // Mirrors WME's check for country/rank based permissions such as
   // "allowEditingTurnGuidanceRank": a boolean user permission wins, otherwise the
   // country's minimum rank applies; null means nobody may edit it.
@@ -211,10 +232,7 @@
     let value = W.model.getUserPermissions?.()?.[id]?.[key];
     if (typeof value !== "boolean") value = W.model.countries?.getObjectById(id)?.getAttribute(key) ?? null;
     if (typeof value === "boolean") return value;
-    if (typeof value === "number") {
-      const { user } = W.loginManager;
-      return (user?.getAttribute?.("rank") ?? user?.attributes?.rank ?? user?.rank ?? 0) >= value;
-    }
+    if (typeof value === "number") return getUserRank() >= value;
     return false;
   }
 
@@ -237,23 +255,24 @@
     const segment = sdk.DataModel.Segments.getById({ segmentId });
     if (!segment) return "segment not found";
     if (sdk.DataModel.Segments.connectsToBigJunction({ segmentId })) return "segment is part of a big junction";
-    if (!sdk.DataModel.Segments.hasPermissions({ segmentId })) return "insufficient permissions";
+    // Closures take edit rights away (geometry, direction), so check them first
     if (segment.hasClosures) return "segment has active closures";
+    const editBlocker = getEditBlocker(segmentId, SEGMENT_PERMISSIONS, sdk);
+    if (editBlocker) return `segment ${editBlocker}, edits could only be submitted for review`;
     for (const [end, nodeId] of [["A", segment.fromNodeId], ["B", segment.toNodeId]]) {
       if (nodeId == null) continue;
       const nodeName = `node ${end} (id ${nodeId})`;
       const node = W.model.nodes.getObjectById(nodeId);
       if (!node) return `${nodeName} is not loaded`;
+      for (const segId of node.getAttribute("segIDs") || []) if (!W.model.segments.getObjectById(segId)) return `connected segment ${segId} at ${nodeName} is not loaded`;
       for (const segId of node.getAttribute("segIDs") || []) {
         if (segId === +segmentId) continue;
         if (sdk.DataModel.Segments.getById({ segmentId: segId })?.hasClosures) return `connected segment ${segId} at ${nodeName} has closures`;
-        if (!sdk.DataModel.Segments.hasPermissions({ segmentId: segId })) {
-          return `connected segment ${segId} at ${nodeName} can't be edited by you (e.g. lock level)`;
-        }
+        const neighborBlocker = getEditBlocker(segId, NEIGHBOR_PERMISSIONS, sdk);
+        if (neighborBlocker) return `connected segment ${segId} at ${nodeName} ${neighborBlocker}`;
       }
       // eslint-disable-next-line no-bitwise
       if ((node.getAttribute("permissions") & NODE_EDIT_FLAGS) !== NODE_EDIT_FLAGS) return `insufficient permissions on ${nodeName} (a connected segment is not fully editable)`;
-      for (const segId of node.getAttribute("segIDs") || []) if (!W.model.segments.getObjectById(segId)) return `connected segment ${segId} at ${nodeName} is not loaded`;
     }
     // Restoring the turns rewrites their turn guidance, which needs the rights for it
     const turns = [...sdk.DataModel.Turns.getTurnsFromSegment({ segmentId }), ...sdk.DataModel.Turns.getTurnsToSegment({ segmentId })];
