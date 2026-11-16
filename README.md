@@ -24,6 +24,7 @@ If the segment can't be reversed, the button is disabled and the reason is shown
 | Allowed turns                   | Restored, including turn restrictions                                 |
 | Turn guidance                   | TTS, road shields, exit signs, towards and visual instructions        |
 | Traffic lights / speed cameras  | Same position, flipped direction, including traffic light guidance    |
+| House numbers                   | Navigation stop points stay on the same spot                          |
 
 If anything could not be restored, a warning is shown so you can check the turns or undo.
 

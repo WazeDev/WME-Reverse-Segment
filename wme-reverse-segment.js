@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         WME Reverse Segment
-// @description  Reverses a selected segment's geometry and swaps all direction-dependent attributes (direction, speed limits, lanes, turns, lane guidance, turn guidance, traffic lights, speed cameras).
+// @description  Reverses a selected segment's geometry and swaps all direction-dependent attributes (direction, speed limits, lanes, turns, lane guidance, turn guidance, traffic lights, speed cameras, house number stop points).
 // @namespace    https://github.com/WazeDev/WME-Reverse-Segment
 // @license      MIT
-// @version      1.0.2
+// @version      1.1.0
 // @match        /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @include      /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @exclude      *://*.waze.com/user/editor*
@@ -35,6 +35,7 @@
     { version: "1.0.0", message: "First public release on Greasy Fork." },
     { version: "1.0.1", message: "Messages name the affected node as node A or node B. Segments with turn guidance you are not allowed to edit (rank) are no longer reversed." },
     { version: "1.0.2", message: "Improved order of the checks. Segments locked above your level are reported as such." },
+    { version: "1.1.0", message: "House numbers keep their navigation stop point on the same spot." },
   ];
 
   // ---------------------------------------------------------------------------
@@ -289,14 +290,27 @@
   // ---------------------------------------------------------------------------
   // reverseSegment
   // ---------------------------------------------------------------------------
-  function reverseSegment(segmentId, sdk) {
-    const blocker = getReverseBlocker(segmentId, sdk);
-    if (blocker) {
+  async function reverseSegment(segmentId, sdk) {
+    const showBlocker = blocker => {
       const msg = `Segment ${segmentId} can't be reversed: ${blocker}.`;
       console.log("[WME RS]", msg);
       WazeWrap.Alerts.warning(SCRIPT_NAME, msg);
+    };
+    let blocker = getReverseBlocker(segmentId, sdk);
+    if (blocker) { showBlocker(blocker); return; }
+
+    // House numbers are only in the data model once loaded (e.g. house number editor),
+    // but their stop points have to be put back after the reverse
+    try {
+      await sdk.DataModel.HouseNumbers.fetchHouseNumbers({ segmentIds: [segmentId] });
+    } catch (e) {
+      console.warn("[WME RS] fetchHouseNumbers", e);
+      showBlocker("its house numbers could not be loaded");
       return;
     }
+    // Anything could have changed while loading
+    blocker = getReverseBlocker(segmentId, sdk);
+    if (blocker) { showBlocker(blocker); return; }
 
     const start = am._undoStack.length;
     try {
@@ -327,6 +341,13 @@
     const hazards = W.model.permanentHazards.getObjectArray()
       .filter(h => h.getAttribute("segmentId") === +segmentId && h.getGeometry()?.type === "Point")
       .map(h => ({ id: h.getID(), direction: h.getAttribute("direction"), geometry: structuredClone(h.getGeometry()) }));
+
+    // House numbers: WME re-snaps the stop point (fractionPoint) on every geometry
+    // change (side is updated by WME itself). Remember the stop points so they can be
+    // put back on the same spot afterwards.
+    const houseNumbers = (W.model.segmentHouseNumbers?.getObjectArray() || [])
+      .filter(h => h.getAttribute("segID") === +segmentId && h.getAttribute("fractionPoint")?.type === "Point")
+      .map(h => ({ id: h.getID(), number: h.getAttribute("number"), fractionPoint: structuredClone(h.getAttribute("fractionPoint")) }));
 
     const { Turns } = sdk.DataModel;
 
@@ -434,6 +455,24 @@
       }
     };
 
+    // Uses the SDK (same action as moving the stop point by hand): a plain UpdateObject
+    // is serialized without the segment and rejected on save.
+    const restoreHouseNumbers = () => {
+      const failed = [];
+      for (const old of houseNumbers) {
+        try {
+          sdk.DataModel.HouseNumbers.moveHouseNumberFractionPoint({ houseNumberId: old.id, fractionPoint: old.fractionPoint });
+        } catch (e) {
+          console.warn("[WME RS] house number", old.id, e);
+          failed.push(old.number);
+        }
+      }
+      if (!failed.length) return;
+      const msg = `Segment ${segmentId}: could not restore the stop point of house number(s) ${failed.join(", ")}. Please check them or undo.`;
+      console.warn("[WME RS]", msg);
+      WazeWrap.Alerts.warning(SCRIPT_NAME, msg);
+    };
+
     // Direction flags of a turn after reverse (only the reversed segment flips)
     const newFwd = (segId, fwd) => (segId === +segmentId ? !fwd : fwd);
 
@@ -477,7 +516,7 @@
 
     // Restore allowed turns including all turn data (guidance, restrictions, ...)
     const SetTurn = getActionClass("SetTurn");
-    if (!SetTurn) { console.warn("[WME RS] SetTurn class not cached. Manually set a turn once to seed the cache."); restoreHazards(); verifyTurns(); return; }
+    if (!SetTurn) { console.warn("[WME RS] SetTurn class not cached. Manually set a turn once to seed the cache."); restoreHazards(); restoreHouseNumbers(); verifyTurns(); return; }
 
     const tg = W.model.turnGraph;
     const newIdByOld = new Map();
@@ -527,6 +566,7 @@
     }
 
     restoreHazards();
+    restoreHouseNumbers();
     verifyTurns();
   }
 
@@ -536,7 +576,7 @@
   let sdk = null;
 
   const INFO_TIP = "Reverses the selected segment's geometry and swaps direction-dependent attributes (direction, speed limits, lanes, "
-    + "turns incl. turn guidance and restrictions, traffic lights, speed cameras). Not supported for segments that are part of a big junction, "
+    + "turns incl. turn guidance and restrictions, traffic lights, speed cameras, house number stop points). Not supported for segments that are part of a big junction, "
     + "a path, has closures or you can't fully edit (both also apply to the segments connected to it).";
 
   function injectButton() {
