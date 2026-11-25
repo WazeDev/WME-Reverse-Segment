@@ -3,7 +3,7 @@
 // @description  Reverses a selected segment's geometry and swaps all direction-dependent attributes (direction, speed limits, lanes, turns, lane guidance, turn guidance, traffic lights, speed cameras, house number stop points).
 // @namespace    https://github.com/WazeDev/WME-Reverse-Segment
 // @license      MIT
-// @version      1.1.0
+// @version      1.1.1
 // @match        /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @include      /^https:\/\/(www|beta)\.waze\.com\/(?!user\/)(.{2,6}\/)?editor\/?.*$/
 // @exclude      *://*.waze.com/user/editor*
@@ -36,6 +36,7 @@
     { version: "1.0.1", message: "Messages name the affected node as node A or node B. Segments with turn guidance you are not allowed to edit (rank) are no longer reversed." },
     { version: "1.0.2", message: "Improved order of the checks. Segments locked above your level are reported as such." },
     { version: "1.1.0", message: "House numbers keep their navigation stop point on the same spot." },
+    { version: "1.1.1", message: "Fixed the Flip A/B button missing from the segment panel after a WME update." },
   ];
 
   // ---------------------------------------------------------------------------
@@ -579,6 +580,19 @@
     + "turns incl. turn guidance and restrictions, traffic lights, speed cameras, house number stop points). Not supported for segments that are part of a big junction, "
     + "a path, has closures or you can't fully edit (both also apply to the segments connected to it).";
 
+  // The level section used to have the class "segment-level-select". Now it is an
+  // unnamed div (with hashed CSS module classes) directly in the segment form, so
+  // start from the level dropdown and walk up to the form's child.
+  function findLevelSection(panel) {
+    const legacy = panel.querySelector(".segment-level-select");
+    if (legacy) return legacy;
+    const select = panel.querySelector("wz-select[name=level]");
+    if (!select) return null;
+    let el = select;
+    while (el.parentElement && el.parentElement !== panel && el.parentElement.tagName !== "FORM") el = el.parentElement;
+    return el;
+  }
+
   function injectButton() {
     // Only inject when a single segment is selected and panel is present
     const panel = document.querySelector(".segment-edit-section");
@@ -586,15 +600,15 @@
     if (document.getElementById("wrs-container")) return;
 
     // Find the anchor element to insert after
-    const levelSelect = panel.querySelector(".segment-level-select");
-    if (!levelSelect) return;
+    const levelSelect = findLevelSection(panel);
+    if (!levelSelect) { console.warn("[WME RS] Level selection not found in the segment panel – button not added."); return; }
 
     const container = document.createElement("div");
     container.id = "wrs-container";
     container.innerHTML = `
       <wz-label>Reverse Segment</wz-label>
       <div style="display:flex; flex-direction:row; align-items:center; margin: 0 5px;">
-        <wz-button color="secondary" size="sm" id="wrs-btn">
+        <wz-button color="secondary" size="sm" type="button" id="wrs-btn">
           <i class="w-icon w-icon-switch"></i>
           Flip A/B
         </wz-button>
